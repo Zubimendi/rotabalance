@@ -1,6 +1,7 @@
 package loadbalancer
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -8,29 +9,28 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"time"
+)
+
+type contextKey string
+
+const (
+	Retry    contextKey = "Retry"
+	Attempts contextKey = "Attempts"
 )
 
 var port int = 8080
 
 type Backend struct {
-	// URL of the backend server
-	URL *url.URL
-
-	// Alive indicates if the backend server is reachable
-	Alive bool
-
-	// mux protects access to the Alive flag for concurrency
-	mux sync.RWMutex
-
-	// ReverseProxy forwards requests to the backend server
+	URL          *url.URL
+	Alive        bool
+	mux          sync.RWMutex
 	ReverseProxy *httputil.ReverseProxy
 }
 
 type ServerPool struct {
-	// A Slice used to keep track of backends in our load balancer
 	backends []*Backend
-	// A counter variable
-	current uint64
+	current  uint64
 }
 
 var serverPool = &ServerPool{
@@ -52,10 +52,35 @@ func main() {
 			log.Fatalf("Failed to parse backend URL %s: %v", backend, err)
 		}
 
+		proxy := httputil.NewSingleHostReverseProxy(url)
+
+		// Assign the error handler for the proxy
+		proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, e error) {
+			log.Printf("[%s] %s\n", url.Host, e.Error())
+			retries := GetRetryFromContext(request)
+			if retries < 3 {
+				select {
+				case <-time.After(10 * time.Millisecond):
+					ctx := context.WithValue(request.Context(), Retry, retries+1)
+					proxy.ServeHTTP(writer, request.WithContext(ctx))
+				}
+				return
+			}
+
+			// After 3 retries, mark this backend as down
+			serverPool.MarkBackendStatus(url, false)
+
+			// Retry with another backend
+			attempts := GetAttemptsFromContext(request)
+			log.Printf("%s(%s) Attempting retry %d\n", request.RemoteAddr, request.URL.Path, attempts)
+			ctx := context.WithValue(request.Context(), Attempts, attempts+1)
+			lb(writer, request.WithContext(ctx))
+		}
+
 		serverPool.backends = append(serverPool.backends, &Backend{
 			URL:          url,
 			Alive:        true, // Assume all backends are alive initially
-			ReverseProxy: httputil.NewSingleHostReverseProxy(url),
+			ReverseProxy: proxy,
 		})
 	}
 
@@ -76,26 +101,23 @@ func main() {
 
 func (s *ServerPool) NextIndex() int {
 	if len(s.backends) == 0 {
-		return -1 // Indicate no backends are available
+		return -1
 	}
 	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 }
 
-// ResetCounter resets the counter safely to prevent overflow
 func (s *ServerPool) ResetCounter() {
 	atomic.StoreUint64(&s.current, 0)
 }
 
-// GetNextPeer returns the next active backend to handle a connection
 func (s *ServerPool) GetNextPeer() *Backend {
 	if len(s.backends) == 0 {
-		return nil // No backends available
+		return nil
 	}
 
 	next := s.NextIndex()
 	totalBackends := len(s.backends)
 
-	// Loop through backends in a circular fashion
 	for i := 0; i < totalBackends; i++ {
 		idx := (next + i) % totalBackends
 		if s.backends[idx].IsAlive() {
@@ -108,21 +130,29 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	return nil
 }
 
-// SetAlive updates the Alive status of the Backend in a thread-safe manner.
+func (s *ServerPool) MarkBackendStatus(url *url.URL, alive bool) {
+	for _, backend := range s.backends {
+		if backend.URL.String() == url.String() {
+			backend.SetAlive(alive)
+			log.Printf("Backend %s marked as %v", url, alive)
+			return
+		}
+	}
+	log.Printf("Backend %s not found in the server pool", url)
+}
+
 func (b *Backend) SetAlive(alive bool) {
 	b.mux.Lock()
 	b.Alive = alive
 	b.mux.Unlock()
 }
 
-// IsAlive checks if the Backend is alive in a thread-safe manner.
 func (b *Backend) IsAlive() bool {
 	b.mux.RLock()
 	defer b.mux.RUnlock()
 	return b.Alive
 }
 
-// lb load balances the incoming request
 func lb(w http.ResponseWriter, r *http.Request) {
 	peer := serverPool.GetNextPeer()
 	if peer != nil {
@@ -132,3 +162,23 @@ func lb(w http.ResponseWriter, r *http.Request) {
 	}
 	http.Error(w, "Service not available", http.StatusServiceUnavailable)
 }
+
+// GetRetryFromContext retrieves the retry count from the request context
+func GetRetryFromContext(r *http.Request) int {
+	if retries, ok := r.Context().Value(Retry).(int); ok {
+		return retries
+	}
+	return 0
+}
+
+// GetAttemptsFromContext retrieves the attempt count from the request context
+func GetAttemptsFromContext(r *http.Request) int {
+	if attempts, ok := r.Context().Value(Attempts).(int); ok {
+		return attempts
+	}
+	return 0
+}
+
+//TODO: 
+// 1. Make Application dynamic by accepting user inputs
+// 2. Refactor codebase and organize functions in different files
