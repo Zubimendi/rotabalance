@@ -1,6 +1,7 @@
 package loadbalancer
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -8,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 )
+
+var port int = 8080
 
 type Backend struct {
 	// URL of the backend server
@@ -30,15 +33,45 @@ type ServerPool struct {
 	current uint64
 }
 
-func main() {
-	u, err := url.Parse("http://localhost:8080")
-	rp := httputil.NewSingleHostReverseProxy(u)
+var serverPool = &ServerPool{
+	backends: []*Backend{},
+}
 
-	if err != nil {
-		log.Fatalf("Failed to parse backend URL: %v", err)
+func main() {
+	// Define backend servers
+	backends := []string{
+		"http://localhost:8081",
+		"http://localhost:8082",
+		"http://localhost:8083",
 	}
-	// initialize your server and add this as handler
-	http.Handle("/load-balancer", http.HandlerFunc(rp.ServeHTTP))
+
+	// Add backends to the server pool
+	for _, backend := range backends {
+		url, err := url.Parse(backend)
+		if err != nil {
+			log.Fatalf("Failed to parse backend URL %s: %v", backend, err)
+		}
+
+		serverPool.backends = append(serverPool.backends, &Backend{
+			URL:          url,
+			Alive:        true, // Assume all backends are alive initially
+			ReverseProxy: httputil.NewSingleHostReverseProxy(url),
+		})
+	}
+
+	// Create the server with the lb handler
+	server := http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: http.HandlerFunc(lb),
+	}
+
+	// Log server start
+	log.Printf("Starting load balancer on port %d...", port)
+
+	// Start the server
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
 }
 
 func (s *ServerPool) NextIndex() int {
@@ -48,37 +81,54 @@ func (s *ServerPool) NextIndex() int {
 	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
 }
 
-// Reset the counter to prevent the counter from becoming too large
+// ResetCounter resets the counter safely to prevent overflow
 func (s *ServerPool) ResetCounter() {
-	atomic.StoreUint64(&s.current, 0) // Reset the counter safely
+	atomic.StoreUint64(&s.current, 0)
 }
 
-// GetNextPeer returns next active peer to take a connection
 // GetNextPeer returns the next active backend to handle a connection
 func (s *ServerPool) GetNextPeer() *Backend {
-    // Ensure backends exist
-    if len(s.backends) == 0 {
-        return nil // No backends available
-    }
+	if len(s.backends) == 0 {
+		return nil // No backends available
+	}
 
-    // Start from the next index
-    next := s.NextIndex()
-    totalBackends := len(s.backends)
+	next := s.NextIndex()
+	totalBackends := len(s.backends)
 
-    // Loop through backends in a circular fashion
-    for i := 0; i < totalBackends; i++ {
-        idx := (next + i) % totalBackends
+	// Loop through backends in a circular fashion
+	for i := 0; i < totalBackends; i++ {
+		idx := (next + i) % totalBackends
+		if s.backends[idx].IsAlive() {
+			if idx != next {
+				atomic.StoreUint64(&s.current, uint64(idx))
+			}
+			return s.backends[idx]
+		}
+	}
+	return nil
+}
 
-        // If backend is alive, mark and return it
-        if s.backends[idx].Alive {
-            // Update the current index if it changed
-            if idx != next {
-                atomic.StoreUint64(&s.current, uint64(idx))
-            }
-            return s.backends[idx]
-        }
-    }
+// SetAlive updates the Alive status of the Backend in a thread-safe manner.
+func (b *Backend) SetAlive(alive bool) {
+	b.mux.Lock()
+	b.Alive = alive
+	b.mux.Unlock()
+}
 
-    // No alive backends found
-    return nil
+// IsAlive checks if the Backend is alive in a thread-safe manner.
+func (b *Backend) IsAlive() bool {
+	b.mux.RLock()
+	defer b.mux.RUnlock()
+	return b.Alive
+}
+
+// lb load balances the incoming request
+func lb(w http.ResponseWriter, r *http.Request) {
+	peer := serverPool.GetNextPeer()
+	if peer != nil {
+		log.Printf("Forwarding request to: %s", peer.URL)
+		peer.ReverseProxy.ServeHTTP(w, r)
+		return
+	}
+	http.Error(w, "Service not available", http.StatusServiceUnavailable)
 }
