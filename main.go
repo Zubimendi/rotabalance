@@ -1,4 +1,4 @@
-package loadbalancer
+package main
 
 import (
 	"context"
@@ -188,17 +188,18 @@ func isBackendAlive(u *url.URL) bool {
     d := net.Dialer{}
     conn, err := d.DialContext(ctx, "tcp", u.Host)
     if err != nil {
-        log.Println("Site unreachable, error: ", err)
+        log.Printf("Site unreachable (%s): %v", u.Host, err)
         return false
     }
+
     if err := conn.Close(); err != nil {
-        log.Printf("Error closing connection: %v", err)
+        log.Printf("Error closing connection to %s: %v", u.Host, err)
     }
     return true
 }
 
-
-  // HealthCheck pings the backends and update the status
+// HealthCheck pings the backends and update the status
+// HealthCheck pings the backends and update the status
 func (s *ServerPool) HealthCheck() {
 	for _, b := range s.backends {
 	  status := "up"
@@ -210,7 +211,6 @@ func (s *ServerPool) HealthCheck() {
 	  log.Printf("%s [%s]\n", b.URL, status)
 	}
   }
-
 //TODO: 
 // 1. Make Application dynamic by accepting user inputs
 // 2. Refactor codebase and organize functions in different files
