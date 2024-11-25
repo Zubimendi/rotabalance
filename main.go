@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -178,6 +179,37 @@ func GetAttemptsFromContext(r *http.Request) int {
 	}
 	return 0
 }
+
+// isAlive checks whether a backend is Alive by establishing a TCP connection
+func isBackendAlive(u *url.URL) bool {
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+    defer cancel()
+
+    d := net.Dialer{}
+    conn, err := d.DialContext(ctx, "tcp", u.Host)
+    if err != nil {
+        log.Println("Site unreachable, error: ", err)
+        return false
+    }
+    if err := conn.Close(); err != nil {
+        log.Printf("Error closing connection: %v", err)
+    }
+    return true
+}
+
+
+  // HealthCheck pings the backends and update the status
+func (s *ServerPool) HealthCheck() {
+	for _, b := range s.backends {
+	  status := "up"
+	  alive := isBackendAlive(b.URL)
+	  b.SetAlive(alive)
+	  if !alive {
+		status = "down"
+	  }
+	  log.Printf("%s [%s]\n", b.URL, status)
+	}
+  }
 
 //TODO: 
 // 1. Make Application dynamic by accepting user inputs
